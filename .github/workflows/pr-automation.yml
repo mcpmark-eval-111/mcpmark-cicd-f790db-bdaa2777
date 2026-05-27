@@ -1,0 +1,361 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: run_eslint
+        run: |
+          npm run lint > eslint-report.txt 2>&1 || echo "eslint_failed=true" >> $GITHUB_ENV
+          cat eslint-report.txt
+
+      - name: Run Prettier
+        id: run_prettier
+        run: |
+          if npm run | grep -q "format"; then
+            npm run format -- --check > prettier-report.txt 2>&1 || echo "prettier_failed=true" >> $GITHUB_ENV
+          elif npm run | grep -q "prettier"; then
+            npm run prettier -- --check > prettier-report.txt 2>&1 || echo "prettier_failed=true" >> $GITHUB_ENV
+          else
+            npx prettier --check . > prettier-report.txt 2>&1 || echo "prettier_failed=true" >> $GITHUB_ENV
+          fi
+          cat prettier-report.txt
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let eslintOut = 'No report';
+            let prettierOut = 'No report';
+            try { eslintOut = fs.readFileSync('eslint-report.txt', 'utf8'); } catch(e) {}
+            try { prettierOut = fs.readFileSync('prettier-report.txt', 'utf8'); } catch(e) {}
+            
+            const isEslintFailed = process.env.eslint_failed === 'true';
+            const isPrettierFailed = process.env.prettier_failed === 'true';
+            
+            const body = `### Code Quality Report
+            
+            - **ESLint Checks**: ${isEslintFailed ? '❌ Failed' : '✅ Passed'}
+            - **Prettier Formatting Checks**: ${isPrettierFailed ? '❌ Failed' : '✅ Passed'}
+            
+            #### ESLint Output
+            \`\`\`
+            ${eslintOut.substring(0, 1500)}
+            \`\`\`
+            
+            #### Prettier Output
+            \`\`\`
+            ${prettierOut.substring(0, 1500)}
+            \`\`\`
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Check Status
+        run: |
+          if [ "${{ env.eslint_failed }}" = "true" ] || [ "${{ env.prettier_failed }}" = "true" ]; then
+            echo "Quality checks failed."
+            exit 1
+          fi
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Tests and Generate Coverage
+        id: run_tests
+        run: |
+          if npm run | grep -q "coverage"; then
+            npm run coverage > test-report.txt 2>&1 || echo "tests_failed=true" >> $GITHUB_ENV
+          else
+            npm test -- --coverage > test-report.txt 2>&1 || npm test > test-report.txt 2>&1 || echo "tests_failed=true" >> $GITHUB_ENV
+          fi
+          cat test-report.txt
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let testOut = 'No report';
+            try { testOut = fs.readFileSync('test-report.txt', 'utf8'); } catch(e) {}
+            
+            const isTestsFailed = process.env.tests_failed === 'true';
+            
+            const body = `### Test Coverage Report
+            
+            - **Test Suite Status**: ${isTestsFailed ? '❌ Failed' : '✅ Passed'}
+            
+            #### Test & Coverage Output
+            \`\`\`
+            ${testOut.substring(0, 1500)}
+            \`\`\`
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Upload Coverage Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            test-report.txt
+          if-no-files-found: ignore
+
+      - name: Check Status
+        run: |
+          if [ "${{ env.tests_failed }}" = "true" ]; then
+            echo "Testing suite failed."
+            exit 1
+          fi
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Audit
+        id: run_audit
+        run: |
+          npm audit > audit-report.txt 2>&1 || echo "audit_failed=true" >> $GITHUB_ENV
+          cat audit-report.txt
+
+      - name: Scan for Secrets
+        id: run_secrets
+        run: |
+          git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} | grep -E '^[+][^+]' | grep -Ei 'api_key|password|secret|token|private_key' > secrets-report.txt || true
+          if [ -s secrets-report.txt ]; then
+            echo "Possible secrets detected!"
+            echo "secrets_found=true" >> $GITHUB_ENV
+          else
+            echo "No secrets found in code changes."
+            echo "No secrets found." > secrets-report.txt
+          fi
+          cat secrets-report.txt
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let auditOut = 'No report';
+            let secretsOut = 'No report';
+            try { auditOut = fs.readFileSync('audit-report.txt', 'utf8'); } catch(e) {}
+            try { secretsOut = fs.readFileSync('secrets-report.txt', 'utf8'); } catch(e) {}
+            
+            const isSecretsFound = process.env.secrets_found === 'true';
+            
+            const body = `### Security Scan Report
+            
+            - **Dependencies Vulnerabilities Check**: Complete. See output below.
+            - **Secrets Scan**: ${isSecretsFound ? '⚠️ Potential secrets found!' : '✅ No secrets found'}
+            
+            #### Dependencies Report
+            \`\`\`
+            ${auditOut.substring(0, 1500)}
+            \`\`\`
+            
+            #### Secrets Report
+            \`\`\`
+            ${secretsOut.substring(0, 1000)}
+            \`\`\`
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Attempt Build
+        id: run_build
+        run: |
+          if npm run | grep -q "build"; then
+            npm run build > build-report.txt 2>&1 || echo "build_failed=true" >> $GITHUB_ENV
+          else
+            echo "No explicit build step found. Making empty build validation." > build-report.txt
+          fi
+          cat build-report.txt
+
+      - name: Validate Endpoints
+        id: run_validation
+        run: |
+          if grep -q '"start":' package.json; then
+            npm start &
+          else
+            node src/app.js &
+          fi
+          APP_PID=$!
+          
+          # Detect port
+          PORT=$(grep -oE "port\s*=\s*[0-9]+" src/app.js | grep -oE "[0-9]+" | head -n 1 || true)
+          if [ -z "$PORT" ]; then
+            PORT=$(grep -oE "listen\([0-9]+" src/app.js | grep -oE "[0-9]+" | head -n 1 || true)
+          fi
+          if [ -z "$PORT" ]; then
+            PORT=3000
+          fi
+          echo "Detected port: $PORT"
+          
+          # Validate
+          success=false
+          for i in {1..15}; do
+            if curl -s http://localhost:$PORT/ > /dev/null; then
+              echo "Endpoint validation successful on port $PORT." > validation-report.txt
+              success=true
+              break
+            fi
+            sleep 1
+          done
+          
+          kill $APP_PID || true
+          
+          if [ "$success" = "false" ]; then
+            echo "Endpoint validation failed on port $PORT." > validation-report.txt
+            echo "validation_failed=true" >> $GITHUB_ENV
+          fi
+          cat validation-report.txt
+
+      - name: Create Deployment Preview Artifacts
+        run: |
+          mkdir -p preview-dist
+          echo "### Deployment Preview Manifest" > preview-dist/preview.md
+          echo "Validated on: $(date)" >> preview-dist/preview.md
+          if [ -d dist ]; then
+            cp -r dist/* preview-dist/ || true
+          fi
+
+      - name: Upload Deployment Preview Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: preview-dist/
+
+      - name: Post Build Validation Comment
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let buildOut = 'No report';
+            let validationOut = 'No report';
+            try { buildOut = fs.readFileSync('build-report.txt', 'utf8'); } catch(e) {}
+            try { validationOut = fs.readFileSync('validation-report.txt', 'utf8'); } catch(e) {}
+            
+            const isBuildFailed = process.env.build_failed === 'true';
+            const isValidationFailed = process.env.validation_failed === 'true';
+            
+            const body = `### Build Validation
+            
+            - **Build Status**: ${isBuildFailed ? '❌ Failed' : '✅ Passed'}
+            - **Endpoint Validation**: ${isValidationFailed ? '❌ Failed' : '✅ Passed'}
+            
+            #### Build Output
+            \`\`\`
+            ${buildOut.substring(0, 1500)}
+            \`\`\`
+            
+            #### Endpoint Validation Output
+            \`\`\`
+            ${validationOut.substring(0, 1000)}
+            \`\`\`
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Check Status
+        run: |
+          if [ "${{ env.build_failed }}" = "true" ] || [ "${{ env.validation_failed }}" = "true" ]; then
+            echo "Build validation failed."
+            exit 1
+          fi
